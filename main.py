@@ -1,0 +1,408 @@
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials as ServiceCredentials
+from googleapiclient.discovery import build
+from email.mime.text import MIMEText
+import base64
+import json
+import time
+import smtplib
+from email.mime.multipart import MIMEMultipart
+
+# Page configuration
+st.set_page_config(page_title="Gmail Auto-Sender", page_icon="📧", layout="wide")
+
+st.title("📧 Automatic Email Sender")
+st.markdown("---")
+
+# Sidebar: Authentication settings
+with st.sidebar:
+    st.header("🔐 Authentication Settings")
+    
+    st.subheader("1. Spreadsheet Authentication")
+    st.caption("Use Service Account")
+    sheets_credentials_json = st.text_area(
+        "Service Account JSON",
+        height=150,
+        help="Paste the JSON key from your service account for reading spreadsheets",
+        key="sheets_creds"
+    )
+    
+    # Display service account email
+    if sheets_credentials_json:
+        try:
+            creds_dict = json.loads(sheets_credentials_json)
+            service_email = creds_dict.get('client_email', '')
+            if service_email:
+                st.success(f"✅ Service Account: `{service_email}`")
+                st.info("💡 Share the spreadsheet with this email address")
+        except:
+            pass
+    
+    st.markdown("---")
+    st.subheader("Spreadsheet Settings")
+    spreadsheet_url = st.text_input(
+        "Spreadsheet URL",
+        help="Enter the URL of the Google Spreadsheet containing the recipient list"
+    )
+    sheet_name = st.text_input("Sheet Name", value="Sheet1")
+
+# Main area
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.header("📋 Email Template")
+    
+    template_source = st.radio(
+        "Template Source",
+        ["Manual Input", "Upload Files"],
+        horizontal=True
+    )
+    
+    if template_source == "Manual Input":
+        subject_template = st.text_input(
+            "Subject Template",
+            value="Hello {{name}}",
+            help="Use {{variable_name}} format for placeholders"
+        )
+        
+        body_template = st.text_area(
+            "Body Template",
+            value="""Dear {{name}},
+
+Thank you for your interest.
+
+{{message}}
+
+Best regards,""",
+            height=300,
+            help="Use {{variable_name}} format for placeholders"
+        )
+    else:
+        st.info("📁 Upload text files containing your email templates. Use {{variable_name}} format for placeholders.")
+        
+        subject_file = st.file_uploader(
+            "Upload Subject Template File",
+            type=['txt'],
+            help="Upload a .txt file containing the subject template",
+            key="subject_file"
+        )
+        
+        body_file = st.file_uploader(
+            "Upload Body Template File",
+            type=['txt'],
+            help="Upload a .txt file containing the body template",
+            key="body_file"
+        )
+        
+        subject_template = ""
+        body_template = ""
+        
+        if subject_file is not None:
+            subject_template = subject_file.read().decode('utf-8')
+            st.success(f"✅ Subject template loaded ({len(subject_template)} characters)")
+            with st.expander("Preview Subject Template"):
+                st.text(subject_template)
+        else:
+            st.warning("⚠️ Please upload a subject template file")
+        
+        if body_file is not None:
+            body_template = body_file.read().decode('utf-8')
+            st.success(f"✅ Body template loaded ({len(body_template)} characters)")
+            with st.expander("Preview Body Template"):
+                st.text(body_template)
+        else:
+            st.warning("⚠️ Please upload a body template file")
+
+with col2:
+    st.header("⚙️ Sending Settings")
+    sender_email = st.text_input(
+        "Sender Email Address",
+        help="Gmail address that will be used to send emails"
+    )
+    
+    test_mode = st.checkbox("Test Mode (Don't actually send)", value=True)
+    delay_seconds = st.slider("Delay between emails (seconds)", min_value=1, max_value=10, value=2)
+    
+    st.info("💡 Your spreadsheet should contain the following columns:\n- email: Recipient email address\n- name: Recipient name\n- Other variables used in templates")
+
+# Load spreadsheet data
+def load_spreadsheet_data(creds_json, sheet_url, sheet_name):
+    try:
+        # Validate JSON
+        creds_dict = json.loads(creds_json)
+        
+        # Required scopes
+        scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+        
+        # Create credentials
+        creds = ServiceCredentials.from_service_account_info(creds_dict, scopes=scopes)
+        
+        # Connect to spreadsheet
+        client = gspread.authorize(creds)
+        
+        # Open spreadsheet from URL
+        spreadsheet = client.open_by_url(sheet_url)
+        
+        # Get worksheet
+        worksheet = spreadsheet.worksheet(sheet_name)
+        
+        # Get data
+        data = worksheet.get_all_records()
+        
+        return data
+        
+    except json.JSONDecodeError as e:
+        st.error(f"❌ JSON Format Error: {str(e)}")
+        st.info("💡 Please check that your service account JSON is in the correct format")
+        return None
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error("❌ Spreadsheet not found")
+        st.info("💡 Check that the URL is correct and the service account has access")
+        return None
+    except PermissionError as e:
+        st.error("❌ Access permission denied")
+        st.warning("🔧 To fix this issue:")
+        st.markdown("""
+        1. Open the spreadsheet
+        2. Click the "Share" button in the top right
+        3. Add the service account email address (shown above)
+        4. Set permission to "Viewer" and send
+        """)
+        return None
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"❌ Sheet '{sheet_name}' not found")
+        st.info("💡 Check that the sheet name is correct (case-sensitive)")
+        return None
+    except gspread.exceptions.APIError as e:
+        st.error(f"❌ Google API Error: {str(e)}")
+        st.info("💡 Make sure Google Sheets API is enabled")
+        return None
+    except Exception as e:
+        st.error(f"❌ Unexpected Error: {type(e).__name__}: {str(e)}")
+        st.info("💡 Please review your settings based on the error details")
+        return None
+
+# Email sending function
+def send_email_simple(to, subject, body, sender_email, app_password):
+    """Send email using App Password"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = to
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(sender_email, app_password)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        error_msg = str(e)
+        if "Application-specific password required" in error_msg or "InvalidSecondFactor" in error_msg:
+            st.error(f"❌ Authentication Error ({to}): App password required")
+            st.warning("⚠️ Regular Gmail passwords cannot be used. Enable 2-step verification and generate an app password.")
+        else:
+            st.error(f"❌ Authentication Error ({to}): {error_msg}")
+        return False
+    except Exception as e:
+        st.error(f"❌ Sending Error ({to}): {str(e)}")
+        return False
+
+# Template processing function
+def apply_template(template, data):
+    result = template
+    for key, value in data.items():
+        placeholder = f"{{{{{key}}}}}"
+        result = result.replace(placeholder, str(value))
+    return result
+
+# Data preview
+if st.button("📊 Preview Spreadsheet Data", type="secondary"):
+    if sheets_credentials_json and spreadsheet_url:
+        with st.spinner("Loading data..."):
+            data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+            if data:
+                st.success(f"✅ Loaded {len(data)} records")
+                st.dataframe(data, use_container_width=True)
+    else:
+        st.warning("Please enter authentication credentials and spreadsheet URL")
+
+st.markdown("---")
+
+# Sending method selection
+st.subheader("📤 Email Sending Setup")
+
+st.error("⚠️ Important: Regular Gmail passwords cannot be used. You must generate an app password.")
+
+st.info("""
+💡 **How to Get Google App Password (5 minutes):**
+
+1. **Enable 2-Step Verification**
+   - Visit https://myaccount.google.com/security
+   - Click "Signing in to Google" → "2-Step Verification"
+   - Register your phone number and enable it
+
+2. **Generate App Password**
+   - Visit https://myaccount.google.com/apppasswords
+   - Select app: "Mail"
+   - Select device: "Other (Custom name)" → Enter any name
+   - Click "Generate"
+   - Copy the 16-digit password displayed (e.g., `abcd efgh ijkl mnop`)
+
+3. **Paste it below**
+   - Spaces will be automatically removed
+""")
+
+app_password = st.text_input(
+    "App Password (16 digits)", 
+    type="password", 
+    help="Enter the 16-digit app password (spaces will be ignored)",
+    placeholder="abcdefghijklmnop or abcd efgh ijkl mnop"
+)
+
+# Send execution
+if st.button("📤 Send Emails", type="primary"):
+    if not sheets_credentials_json or not spreadsheet_url or not sender_email:
+        st.error("Please fill in all required fields")
+    elif not app_password:
+        st.error("Please enter your app password")
+    elif not subject_template or not body_template:
+        st.error("Please provide both subject and body templates")
+    else:
+        with st.spinner("Preparing to send emails..."):
+            data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+            
+            if data:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                success_count = 0
+                fail_count = 0
+                
+                for idx, row in enumerate(data):
+                    if 'email' not in row:
+                        st.warning(f"⚠️ Row {idx+1}: Email address not found")
+                        fail_count += 1
+                        continue
+                    
+                    subject = apply_template(subject_template, row)
+                    body = apply_template(body_template, row)
+                    
+                    status_text.text(f"Sending: {row['email']} ({idx+1}/{len(data)})")
+                    
+                    if test_mode:
+                        st.info(f"🧪 Test Mode: Simulating send to {row['email']}")
+                        with st.expander(f"Email Preview: {row['email']}"):
+                            st.write(f"**Subject:** {subject}")
+                            st.write(f"**Body:**")
+                            st.text(body)
+                        success_count += 1
+                    else:
+                        # Remove spaces from app password
+                        clean_password = app_password.replace(" ", "")
+                        if send_email_simple(row['email'], subject, body, sender_email, clean_password):
+                            st.success(f"✅ Sent successfully: {row['email']}")
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    
+                    progress_bar.progress((idx + 1) / len(data))
+                    time.sleep(delay_seconds)
+                
+                status_text.text("Complete")
+                st.balloons()
+                
+                st.markdown("---")
+                st.subheader("📊 Sending Results")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total", len(data))
+                col2.metric("Success", success_count)
+                col3.metric("Failed", fail_count)
+
+# Footer
+st.markdown("---")
+with st.expander("📖 How to Use"):
+    st.markdown("""
+    ### Setup Instructions
+    
+    #### Google Cloud Console Setup (for Spreadsheet)
+    
+    1. **Create a Google Cloud Project**
+       - Visit https://console.cloud.google.com
+       - Create a new project
+    
+    2. **Enable Google Sheets API**
+       - In the project, go to "APIs & Services" → "Library"
+       - Search for "Google Sheets API" and enable it
+    
+    3. **Create Service Account**
+       - Go to "APIs & Services" → "Credentials"
+       - Click "Create Credentials" → "Service Account"
+       - Fill in the details and create
+       - Click on the created service account
+       - Go to "Keys" tab → "Add Key" → "Create new key" → "JSON"
+       - Download the JSON file
+    
+    #### Get Google App Password (for Gmail Sending)
+    
+    1. **Enable 2-Step Verification**
+       - Visit https://myaccount.google.com/security
+       - Enable 2-Step Verification with your phone number
+    
+    2. **Generate App Password**
+       - Visit https://myaccount.google.com/apppasswords
+       - Generate a 16-digit app password
+    
+    #### Prepare Spreadsheet
+    
+    1. **Create a spreadsheet with recipient list**
+       - Required column: `email`
+       - Other columns for variables used in templates (e.g., `name`, `message`)
+    
+    2. **Share spreadsheet with service account**
+       - Copy the `client_email` from the service account JSON
+       - Share the spreadsheet with this email address (Viewer permission)
+    
+    #### Prepare Template Files (Optional)
+    
+    If using "Upload Files" mode:
+    
+    1. **Create subject template file** (e.g., `subject.txt`)
+       ```
+       Hello {{name}} - Special Offer
+       ```
+    
+    2. **Create body template file** (e.g., `body.txt`)
+       ```
+       Dear {{name}},
+       
+       We are pleased to offer you:
+       {{message}}
+       
+       Best regards,
+       Support Team
+       ```
+    
+    3. **Upload both files in the app**
+       - Use plain text (.txt) files
+       - Use {{variable_name}} format for placeholders
+       - Variables must match column names in your spreadsheet
+    
+    #### Use the App
+    
+    1. Paste the service account JSON in the sidebar
+    2. Enter the spreadsheet URL and sheet name
+    3. Enter your app password
+    4. Choose template source (Manual Input or Upload Files)
+    5. Set up email templates (either type them or upload files)
+    6. Preview data to confirm
+    7. Test in Test Mode first, then send for real
+    
+    ### Important Notes
+    - Gmail has sending limits (approximately 500 emails per day)
+    - Set appropriate sending intervals for bulk emails
+    - Always test in Test Mode first before actual sending
+    """)
