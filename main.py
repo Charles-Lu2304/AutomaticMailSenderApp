@@ -8,6 +8,7 @@ import json
 import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
+import pandas as pd
 
 # Page configuration
 st.set_page_config(page_title="Gmail Auto-Sender", page_icon="📧", layout="wide")
@@ -17,35 +18,60 @@ st.markdown("---")
 
 # Sidebar: Authentication settings
 with st.sidebar:
-    st.header("🔐 Authentication Settings")
+    st.header("🔐 Data Source Settings")
     
-    st.subheader("1. Spreadsheet Authentication")
-    st.caption("Use Service Account")
-    sheets_credentials_json = st.text_area(
-        "Service Account JSON",
-        height=150,
-        help="Paste the JSON key from your service account for reading spreadsheets",
-        key="sheets_creds"
+    # Data source selection
+    data_source = st.radio(
+        "Data Source",
+        ["Google Sheets", "Excel File"],
+        help="Choose the source of your recipient list"
     )
-    
-    # Display service account email
-    if sheets_credentials_json:
-        try:
-            creds_dict = json.loads(sheets_credentials_json)
-            service_email = creds_dict.get('client_email', '')
-            if service_email:
-                st.success(f"✅ Service Account: `{service_email}`")
-                st.info("💡 Share the spreadsheet with this email address")
-        except:
-            pass
     
     st.markdown("---")
-    st.subheader("Spreadsheet Settings")
-    spreadsheet_url = st.text_input(
-        "Spreadsheet URL",
-        help="Enter the URL of the Google Spreadsheet containing the recipient list"
-    )
-    sheet_name = st.text_input("Sheet Name", value="Sheet1")
+    
+    # Google Sheets section
+    if data_source == "Google Sheets":
+        st.subheader("1. Spreadsheet Authentication")
+        st.caption("Use Service Account")
+        sheets_credentials_json = st.text_area(
+            "Service Account JSON",
+            height=150,
+            help="Paste the JSON key from your service account for reading spreadsheets",
+            key="sheets_creds"
+        )
+        
+        # Display service account email
+        if sheets_credentials_json:
+            try:
+                creds_dict = json.loads(sheets_credentials_json)
+                service_email = creds_dict.get('client_email', '')
+                if service_email:
+                    st.success(f"✅ Service Account: `{service_email}`")
+                    st.info("💡 Share the spreadsheet with this email address")
+            except:
+                pass
+        
+        st.markdown("---")
+        st.subheader("Spreadsheet Settings")
+        spreadsheet_url = st.text_input(
+            "Spreadsheet URL",
+            help="Enter the URL of the Google Spreadsheet containing the recipient list"
+        )
+        sheet_name = st.text_input("Sheet Name", value="Sheet1", key="sheets_sheet_name")
+    else:
+        # Excel File section
+        st.subheader("Excel File Settings")
+        excel_file = st.file_uploader(
+            "Upload Excel File",
+            type=['xlsx', 'xls'],
+            help="Upload an Excel file (.xlsx or .xls) containing the recipient list",
+            key="excel_file"
+        )
+        sheet_name = st.text_input("Sheet Name", value="Sheet1", key="excel_sheet_name")
+        
+        # Initialize variables for Google Sheets (to avoid errors)
+        sheets_credentials_json = ""
+        spreadsheet_url = ""
 
 # Main area
 col1, col2 = st.columns([1, 1])
@@ -125,6 +151,44 @@ with col2:
     delay_seconds = st.slider("Delay between emails (seconds)", min_value=1, max_value=10, value=2)
     
     st.info("💡 Your spreadsheet should contain the following columns:\n- email: Recipient email address\n- name: Recipient name\n- Other variables used in templates")
+
+# Load Excel data
+def load_excel_data(excel_file, sheet_name):
+    """Load data from uploaded Excel file"""
+    try:
+        # Read Excel file
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+        
+        # Check if dataframe is empty
+        if df.empty:
+            st.error("❌ Excel file is empty")
+            st.info("💡 Please ensure the Excel file contains data")
+            return None
+        
+        # Convert to list of dictionaries (same format as Google Sheets)
+        data = df.to_dict('records')
+        
+        # Convert NaN values to empty strings for consistency
+        for record in data:
+            for key, value in record.items():
+                if pd.isna(value):
+                    record[key] = ""
+        
+        return data
+        
+    except ValueError as e:
+        error_msg = str(e)
+        if "Worksheet named" in error_msg:
+            st.error(f"❌ Sheet '{sheet_name}' not found")
+            st.info("💡 Check that the sheet name is correct (case-sensitive)")
+        else:
+            st.error(f"❌ Excel Format Error: {error_msg}")
+            st.info("💡 Please check that your Excel file is in the correct format")
+        return None
+    except Exception as e:
+        st.error(f"❌ Excel Reading Error: {type(e).__name__}: {str(e)}")
+        st.info("💡 Please review your Excel file and try again")
+        return None
 
 # Load spreadsheet data
 def load_spreadsheet_data(creds_json, sheet_url, sheet_name):
@@ -220,15 +284,25 @@ def apply_template(template, data):
     return result
 
 # Data preview
-if st.button("📊 Preview Spreadsheet Data", type="secondary"):
-    if sheets_credentials_json and spreadsheet_url:
-        with st.spinner("Loading data..."):
-            data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
-            if data:
-                st.success(f"✅ Loaded {len(data)} records")
-                st.dataframe(data, use_container_width=True)
-    else:
-        st.warning("Please enter authentication credentials and spreadsheet URL")
+if st.button("📊 Preview Data", type="secondary"):
+    if data_source == "Google Sheets":
+        if sheets_credentials_json and spreadsheet_url:
+            with st.spinner("Loading data..."):
+                data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+                if data:
+                    st.success(f"✅ Loaded {len(data)} records")
+                    st.dataframe(data, use_container_width=True)
+        else:
+            st.warning("Please enter authentication credentials and spreadsheet URL")
+    else:  # Excel File
+        if excel_file is not None:
+            with st.spinner("Loading data..."):
+                data = load_excel_data(excel_file, sheet_name)
+                if data:
+                    st.success(f"✅ Loaded {len(data)} records")
+                    st.dataframe(data, use_container_width=True)
+        else:
+            st.warning("Please upload an Excel file")
 
 st.markdown("---")
 
@@ -265,15 +339,29 @@ app_password = st.text_input(
 
 # Send execution
 if st.button("📤 Send Emails", type="primary"):
-    if not sheets_credentials_json or not spreadsheet_url or not sender_email:
-        st.error("Please fill in all required fields")
-    elif not app_password:
-        st.error("Please enter your app password")
-    elif not subject_template or not body_template:
-        st.error("Please provide both subject and body templates")
-    else:
-        with st.spinner("Preparing to send emails..."):
-            data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+    # Validate based on data source
+    validation_error = False
+    
+    if data_source == "Google Sheets":
+        if not sheets_credentials_json or not spreadsheet_url or not sender_email:
+            st.error("Please fill in all required fields")
+            validation_error = True
+    else:  # Excel File
+        if excel_file is None or not sender_email:
+            st.error("Please fill in all required fields")
+            validation_error = True
+    
+    if not validation_error:
+        if not app_password:
+            st.error("Please enter your app password")
+        elif not subject_template or not body_template:
+            st.error("Please provide both subject and body templates")
+        else:
+            with st.spinner("Preparing to send emails..."):
+                if data_source == "Google Sheets":
+                    data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+                else:  # Excel File
+                    data = load_excel_data(excel_file, sheet_name)
             
             if data:
                 progress_bar = st.progress(0)
