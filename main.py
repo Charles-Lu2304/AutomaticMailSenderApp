@@ -2,6 +2,8 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 from email.mime.text import MIMEText
 import base64
 import json
@@ -9,6 +11,8 @@ import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 import pandas as pd
+import io
+import re
 
 # Page configuration
 st.set_page_config(page_title="Gmail Auto-Sender", page_icon="📧", layout="wide")
@@ -23,7 +27,7 @@ with st.sidebar:
     # Data source selection
     data_source = st.radio(
         "Data Source",
-        ["Google Sheets", "Excel File"],
+        ["Google Sheets", "Excel File (Local Upload)", "Google Drive Excel"],
         help="Choose the source of your recipient list"
     )
     
@@ -58,7 +62,7 @@ with st.sidebar:
             help="Enter the URL of the Google Spreadsheet containing the recipient list"
         )
         sheet_name = st.text_input("Sheet Name", value="Sheet1", key="sheets_sheet_name")
-    else:
+    elif data_source == "Excel File (Local Upload)":
         # Excel File section
         st.subheader("Excel File Settings")
         excel_file = st.file_uploader(
@@ -72,6 +76,40 @@ with st.sidebar:
         # Initialize variables for Google Sheets (to avoid errors)
         sheets_credentials_json = ""
         spreadsheet_url = ""
+    else:
+        # Google Drive Excel section
+        st.subheader("1. Google Drive Authentication")
+        st.caption("Use Service Account")
+        sheets_credentials_json = st.text_area(
+            "Service Account JSON",
+            height=150,
+            help="Paste the JSON key from your service account for accessing Google Drive",
+            key="drive_creds"
+        )
+        
+        # Display service account email
+        if sheets_credentials_json:
+            try:
+                creds_dict = json.loads(sheets_credentials_json)
+                service_email = creds_dict.get('client_email', '')
+                if service_email:
+                    st.success(f"✅ Service Account: `{service_email}`")
+                    st.info("💡 Share the Google Drive file with this email address")
+            except:
+                pass
+        
+        st.markdown("---")
+        st.subheader("Google Drive File Settings")
+        drive_file_url = st.text_input(
+            "Google Drive File URL",
+            help="Enter the URL of the Excel file stored in Google Drive",
+            placeholder="https://drive.google.com/file/d/FILE_ID/view"
+        )
+        sheet_name = st.text_input("Sheet Name", value="Sheet1", key="drive_sheet_name")
+        
+        # Initialize variables for other sources
+        spreadsheet_url = ""
+        excel_file = None
 
 # Main area
 col1, col2 = st.columns([1, 1])
@@ -151,6 +189,121 @@ with col2:
     delay_seconds = st.slider("Delay between emails (seconds)", min_value=1, max_value=10, value=2)
     
     st.info("💡 Your spreadsheet should contain the following columns:\n- email: Recipient email address\n- name: Recipient name\n- Other variables used in templates")
+
+# Extract file ID from Google Drive URL
+def extract_file_id_from_url(url):
+    """Extract file ID from various Google Drive URL formats"""
+    if not url:
+        return None
+    
+    # Pattern 1: /file/d/{FILE_ID}/
+    pattern1 = r'/file/d/([a-zA-Z0-9_-]+)'
+    match = re.search(pattern1, url)
+    if match:
+        return match.group(1)
+    
+    # Pattern 2: ?id={FILE_ID}
+    pattern2 = r'[?&]id=([a-zA-Z0-9_-]+)'
+    match = re.search(pattern2, url)
+    if match:
+        return match.group(1)
+    
+    # Pattern 3: /d/{FILE_ID}/
+    pattern3 = r'/d/([a-zA-Z0-9_-]+)'
+    match = re.search(pattern3, url)
+    if match:
+        return match.group(1)
+    
+    return None
+
+# Load Google Drive Excel data
+def load_google_drive_excel(creds_json, file_url, sheet_name):
+    """Load Excel data from Google Drive"""
+    try:
+        # Validate JSON
+        creds_dict = json.loads(creds_json)
+        
+        # Extract file ID from URL
+        file_id = extract_file_id_from_url(file_url)
+        if not file_id:
+            st.error("❌ Invalid Google Drive URL")
+            st.info("💡 Please use a valid Google Drive file URL (e.g., https://drive.google.com/file/d/FILE_ID/view)")
+            return None
+        
+        # Required scopes
+        scopes = ['https://www.googleapis.com/auth/drive.readonly']
+        
+        # Create credentials
+        creds = ServiceCredentials.from_service_account_info(creds_dict, scopes=scopes)
+        
+        # Build Drive service
+        service = build('drive', 'v3', credentials=creds)
+        
+        # Download file
+        request = service.files().get_media(fileId=file_id)
+        file_content = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_content, request)
+        
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        
+        # Reset file pointer to beginning
+        file_content.seek(0)
+        
+        # Read Excel file with pandas
+        df = pd.read_excel(file_content, sheet_name=sheet_name, engine='openpyxl')
+        
+        # Check if dataframe is empty
+        if df.empty:
+            st.error("❌ Excel file is empty")
+            st.info("💡 Please ensure the Excel file contains data")
+            return None
+        
+        # Convert to list of dictionaries
+        data = df.to_dict('records')
+        
+        # Convert NaN values to empty strings
+        for record in data:
+            for key, value in record.items():
+                if pd.isna(value):
+                    record[key] = ""
+        
+        return data
+        
+    except json.JSONDecodeError as e:
+        st.error(f"❌ JSON Format Error: {str(e)}")
+        st.info("💡 Please check that your service account JSON is in the correct format")
+        return None
+    except HttpError as e:
+        if e.resp.status == 404:
+            st.error("❌ File not found")
+            st.info("💡 Check that the file ID is correct and the file exists")
+        elif e.resp.status == 403:
+            st.error("❌ Access permission denied")
+            st.warning("🔧 To fix this issue:")
+            st.markdown("""
+            1. Open the file in Google Drive
+            2. Click the "Share" button
+            3. Add the service account email address (shown above)
+            4. Set permission to "Viewer" and send
+            """)
+        else:
+            st.error(f"❌ Google Drive API Error: {str(e)}")
+        return None
+    except ValueError as e:
+        error_msg = str(e)
+        if "Worksheet named" in error_msg:
+            st.error(f"❌ Sheet '{sheet_name}' not found")
+            st.info("💡 Check that the sheet name is correct (case-sensitive)")
+        else:
+            st.error(f"❌ Excel Format Error: {error_msg}")
+            st.info("💡 Please check that your Excel file is in the correct format")
+        return None
+    except Exception as e:
+        st.error(f"❌ Unexpected Error: {type(e).__name__}: {str(e)}")
+        st.info("💡 Please review your settings based on the error details")
+        return None
 
 # Load Excel data
 def load_excel_data(excel_file, sheet_name):
@@ -294,7 +447,7 @@ if st.button("📊 Preview Data", type="secondary"):
                     st.dataframe(data, use_container_width=True)
         else:
             st.warning("Please enter authentication credentials and spreadsheet URL")
-    else:  # Excel File
+    elif data_source == "Excel File (Local Upload)":
         if excel_file is not None:
             with st.spinner("Loading data..."):
                 data = load_excel_data(excel_file, sheet_name)
@@ -303,6 +456,15 @@ if st.button("📊 Preview Data", type="secondary"):
                     st.dataframe(data, use_container_width=True)
         else:
             st.warning("Please upload an Excel file")
+    else:  # Google Drive Excel
+        if sheets_credentials_json and drive_file_url:
+            with st.spinner("Loading data..."):
+                data = load_google_drive_excel(sheets_credentials_json, drive_file_url, sheet_name)
+                if data:
+                    st.success(f"✅ Loaded {len(data)} records")
+                    st.dataframe(data, use_container_width=True)
+        else:
+            st.warning("Please enter authentication credentials and Google Drive file URL")
 
 st.markdown("---")
 
@@ -346,8 +508,12 @@ if st.button("📤 Send Emails", type="primary"):
         if not sheets_credentials_json or not spreadsheet_url or not sender_email:
             st.error("Please fill in all required fields")
             validation_error = True
-    else:  # Excel File
+    elif data_source == "Excel File (Local Upload)":
         if excel_file is None or not sender_email:
+            st.error("Please fill in all required fields")
+            validation_error = True
+    else:  # Google Drive Excel
+        if not sheets_credentials_json or not drive_file_url or not sender_email:
             st.error("Please fill in all required fields")
             validation_error = True
     
@@ -360,8 +526,10 @@ if st.button("📤 Send Emails", type="primary"):
             with st.spinner("Preparing to send emails..."):
                 if data_source == "Google Sheets":
                     data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
-                else:  # Excel File
+                elif data_source == "Excel File (Local Upload)":
                     data = load_excel_data(excel_file, sheet_name)
+                else:  # Google Drive Excel
+                    data = load_google_drive_excel(sheets_credentials_json, drive_file_url, sheet_name)
             
             if data:
                 progress_bar = st.progress(0)
