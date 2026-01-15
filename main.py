@@ -17,6 +17,16 @@ import re
 # Page configuration
 st.set_page_config(page_title="Gmail Auto-Sender", page_icon="📧", layout="wide")
 
+# Initialize session state
+if 'available_columns' not in st.session_state:
+    st.session_state.available_columns = ["Email"]
+if 'loaded_data' not in st.session_state:
+    st.session_state.loaded_data = None
+if 'email_column' not in st.session_state:
+    st.session_state.email_column = 'email'
+if 'data_source_key' not in st.session_state:
+    st.session_state.data_source_key = None
+
 st.title("📧 Automatic Email Sender")
 st.markdown("---")
 
@@ -443,8 +453,10 @@ if st.button("📊 Preview Data", type="secondary"):
             with st.spinner("Loading data..."):
                 data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
                 if data:
-                    st.success(f"✅ Loaded {len(data)} records")
-                    st.dataframe(data, use_container_width=True)
+                    # Save to session state
+                    st.session_state.available_columns = list(data[0].keys()) if data else ["email"]
+                    st.session_state.loaded_data = data
+                    st.session_state.data_source_key = data_source
         else:
             st.warning("Please enter authentication credentials and spreadsheet URL")
     elif data_source == "Excel File (Local Upload)":
@@ -452,8 +464,10 @@ if st.button("📊 Preview Data", type="secondary"):
             with st.spinner("Loading data..."):
                 data = load_excel_data(excel_file, sheet_name)
                 if data:
-                    st.success(f"✅ Loaded {len(data)} records")
-                    st.dataframe(data, use_container_width=True)
+                    # Save to session state
+                    st.session_state.available_columns = list(data[0].keys()) if data else ["email"]
+                    st.session_state.loaded_data = data
+                    st.session_state.data_source_key = data_source
         else:
             st.warning("Please upload an Excel file")
     else:  # Google Drive Excel
@@ -461,10 +475,37 @@ if st.button("📊 Preview Data", type="secondary"):
             with st.spinner("Loading data..."):
                 data = load_google_drive_excel(sheets_credentials_json, drive_file_url, sheet_name)
                 if data:
-                    st.success(f"✅ Loaded {len(data)} records")
-                    st.dataframe(data, use_container_width=True)
+                    # Save to session state
+                    st.session_state.available_columns = list(data[0].keys()) if data else ["email"]
+                    st.session_state.loaded_data = data
+                    st.session_state.data_source_key = data_source
         else:
             st.warning("Please enter authentication credentials and Google Drive file URL")
+
+# Display loaded data if exists
+if st.session_state.loaded_data is not None:
+    st.success(f"✅ Loaded {len(st.session_state.loaded_data)} records")
+    st.dataframe(st.session_state.loaded_data, use_container_width=True)
+
+# Email column selection (always visible)
+st.markdown("---")
+st.subheader("📧 Email Column Selection")
+
+# Set default index
+default_index = 0
+if 'email' in st.session_state.available_columns:
+    default_index = st.session_state.available_columns.index('email')
+
+email_column = st.selectbox(
+    "Select the column containing email addresses",
+    options=st.session_state.available_columns,
+    index=default_index,
+    key="email_column_selector",
+    help="Choose which column contains the recipient email addresses"
+)
+
+st.session_state.email_column = email_column
+st.info(f"💡 Using column '{email_column}' for email addresses")
 
 st.markdown("---")
 
@@ -522,14 +563,24 @@ if st.button("📤 Send Emails", type="primary"):
             st.error("Please enter your app password")
         elif not subject_template or not body_template:
             st.error("Please provide both subject and body templates")
+        elif 'email_column' not in st.session_state or not st.session_state.email_column:
+            st.error("Please preview data and select an email column first")
         else:
             with st.spinner("Preparing to send emails..."):
-                if data_source == "Google Sheets":
-                    data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
-                elif data_source == "Excel File (Local Upload)":
-                    data = load_excel_data(excel_file, sheet_name)
-                else:  # Google Drive Excel
-                    data = load_google_drive_excel(sheets_credentials_json, drive_file_url, sheet_name)
+                # Check if we can reuse loaded data
+                if ('loaded_data' in st.session_state and 
+                    st.session_state.loaded_data is not None and
+                    'data_source_key' in st.session_state and 
+                    st.session_state.data_source_key == data_source):
+                    data = st.session_state.loaded_data
+                else:
+                    # Reload data
+                    if data_source == "Google Sheets":
+                        data = load_spreadsheet_data(sheets_credentials_json, spreadsheet_url, sheet_name)
+                    elif data_source == "Excel File (Local Upload)":
+                        data = load_excel_data(excel_file, sheet_name)
+                    else:  # Google Drive Excel
+                        data = load_google_drive_excel(sheets_credentials_json, drive_file_url, sheet_name)
             
             if data:
                 progress_bar = st.progress(0)
@@ -538,20 +589,31 @@ if st.button("📤 Send Emails", type="primary"):
                 success_count = 0
                 fail_count = 0
                 
+                # Get selected email column
+                email_col = st.session_state.get('email_column', 'email')
+                
                 for idx, row in enumerate(data):
-                    if 'email' not in row:
-                        st.warning(f"⚠️ Row {idx+1}: Email address not found")
+                    if email_col not in row:
+                        st.warning(f"⚠️ Row {idx+1}: Email address not found in column '{email_col}'")
+                        fail_count += 1
+                        continue
+                    
+                    recipient_email = row[email_col]
+                    
+                    # Check if email is empty
+                    if not recipient_email or str(recipient_email).strip() == "":
+                        st.warning(f"⚠️ Row {idx+1}: Email address is empty")
                         fail_count += 1
                         continue
                     
                     subject = apply_template(subject_template, row)
                     body = apply_template(body_template, row)
                     
-                    status_text.text(f"Sending: {row['email']} ({idx+1}/{len(data)})")
+                    status_text.text(f"Sending: {recipient_email} ({idx+1}/{len(data)})")
                     
                     if test_mode:
-                        st.info(f"🧪 Test Mode: Simulating send to {row['email']}")
-                        with st.expander(f"Email Preview: {row['email']}"):
+                        st.info(f"🧪 Test Mode: Simulating send to {recipient_email}")
+                        with st.expander(f"Email Preview: {recipient_email}"):
                             st.write(f"**Subject:** {subject}")
                             st.write(f"**Body:**")
                             st.text(body)
@@ -559,8 +621,8 @@ if st.button("📤 Send Emails", type="primary"):
                     else:
                         # Remove spaces from app password
                         clean_password = app_password.replace(" ", "")
-                        if send_email_simple(row['email'], subject, body, sender_email, clean_password):
-                            st.success(f"✅ Sent successfully: {row['email']}")
+                        if send_email_simple(recipient_email, subject, body, sender_email, clean_password):
+                            st.success(f"✅ Sent successfully: {recipient_email}")
                             success_count += 1
                         else:
                             fail_count += 1
