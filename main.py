@@ -195,6 +195,19 @@ with col2:
         help="Gmail address that will be used to send emails"
     )
     
+    # CC and BCC inputs
+    cc_addresses = st.text_input(
+        "CC (Optional)",
+        help="Enter CC email addresses separated by commas",
+        placeholder="user1@example.com, user2@example.com"
+    )
+    
+    bcc_addresses = st.text_input(
+        "BCC (Optional)",
+        help="Enter BCC email addresses separated by commas",
+        placeholder="user1@example.com, user2@example.com"
+    )
+    
     test_mode = st.checkbox("Test Mode (Don't actually send)", value=True)
     delay_seconds = st.slider("Delay between emails (seconds)", min_value=1, max_value=10, value=2)
     
@@ -411,19 +424,36 @@ def load_spreadsheet_data(creds_json, sheet_url, sheet_name):
         return None
 
 # Email sending function
-def send_email_simple(to, subject, body, sender_email, app_password):
-    """Send email using App Password"""
+def send_email_simple(to, subject, body, sender_email, app_password, cc=None, bcc=None):
+    """Send email using App Password with CC and BCC support"""
     try:
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = to
         msg['Subject'] = subject
+        
+        # Add CC header if provided
+        if cc:
+            cc_list = cc if isinstance(cc, list) else [cc]
+            msg['Cc'] = ', '.join(cc_list)
+        
+        # Note: BCC is not added to headers (to keep it hidden)
+        
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        # Prepare recipient list
+        recipients = [to]
+        if cc:
+            cc_list = cc if isinstance(cc, list) else [cc]
+            recipients.extend(cc_list)
+        if bcc:
+            bcc_list = bcc if isinstance(bcc, list) else [bcc]
+            recipients.extend(bcc_list)
         
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(sender_email, app_password)
-        server.send_message(msg)
+        server.sendmail(sender_email, recipients, msg.as_string())
         server.quit()
         return True
     except smtplib.SMTPAuthenticationError as e:
@@ -566,6 +596,16 @@ if st.button("📤 Send Emails", type="primary"):
         elif 'email_column' not in st.session_state or not st.session_state.email_column:
             st.error("Please preview data and select an email column first")
         else:
+            # Parse CC addresses
+            cc_list = []
+            if cc_addresses and cc_addresses.strip():
+                cc_list = [email.strip() for email in cc_addresses.split(',') if email.strip()]
+            
+            # Parse BCC addresses
+            bcc_list = []
+            if bcc_addresses and bcc_addresses.strip():
+                bcc_list = [email.strip() for email in bcc_addresses.split(',') if email.strip()]
+            
             with st.spinner("Preparing to send emails..."):
                 # Check if we can reuse loaded data
                 if ('loaded_data' in st.session_state and 
@@ -614,6 +654,11 @@ if st.button("📤 Send Emails", type="primary"):
                     if test_mode:
                         st.info(f"🧪 Test Mode: Simulating send to {recipient_email}")
                         with st.expander(f"Email Preview: {recipient_email}"):
+                            st.write(f"**To:** {recipient_email}")
+                            if cc_list:
+                                st.write(f"**CC:** {', '.join(cc_list)}")
+                            if bcc_list:
+                                st.write(f"**BCC:** {', '.join(bcc_list)}")
                             st.write(f"**Subject:** {subject}")
                             st.write(f"**Body:**")
                             st.text(body)
@@ -621,7 +666,9 @@ if st.button("📤 Send Emails", type="primary"):
                     else:
                         # Remove spaces from app password
                         clean_password = app_password.replace(" ", "")
-                        if send_email_simple(recipient_email, subject, body, sender_email, clean_password):
+                        if send_email_simple(recipient_email, subject, body, sender_email, clean_password,
+                                           cc=cc_list if cc_list else None,
+                                           bcc=bcc_list if bcc_list else None):
                             st.success(f"✅ Sent successfully: {recipient_email}")
                             success_count += 1
                         else:
